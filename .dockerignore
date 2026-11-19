@@ -1,0 +1,5 @@
+.git
+.local
+dist
+tmp
+__pycache__

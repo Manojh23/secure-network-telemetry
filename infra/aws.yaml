@@ -1,0 +1,109 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Single-replica network telemetry demo, native TLS 1.3, encrypted EBS and runtime Secrets Manager retrieval.
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet with an internet gateway route; no SSH is opened.
+  AllowedClientCidr:
+    Type: String
+    Description: Trusted probe network CIDR; do not allow the public internet.
+  ConfigurationSecretArn:
+    Type: String
+    Description: SecretString JSON containing keys_json, tls_cert, tls_key. Certificate must match the endpoint hostname.
+  ImageUri:
+    Type: String
+    Description: Private ECR image URI pinned to a sha256 digest, in the same AWS account and region.
+    AllowedPattern: '.+\.dkr\.ecr\..+\.amazonaws\.com/.+@sha256:[a-f0-9]{64}'
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+Rules:
+  RestrictIngress:
+    Assertions:
+      - Assert:
+          Fn::Not:
+            - Fn::Equals: [!Ref AllowedClientCidr, '0.0.0.0/0']
+        AssertDescription: Use a restricted trusted-client network.
+Resources:
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: TLS telemetry ingress only; no SSH
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 9443
+          ToPort: 9443
+          CidrIp: !Ref AllowedClientCidr
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReadTelemetryConfigAndImage
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref ConfigurationSecretArn
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:GetDownloadUrlForLayer, ecr:BatchGetImage]
+                Resource: !Sub arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/*
+  Profile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref Role]
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: t3.small
+      IamInstanceProfile: !Ref Profile
+      MetadataOptions: {HttpTokens: required, HttpEndpoint: enabled, HttpPutResponseHopLimit: 1}
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          AssociatePublicIpAddress: true
+          SubnetId: !Ref SubnetId
+          GroupSet: [!Ref SecurityGroup]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: {Encrypted: true, VolumeSize: 16, VolumeType: gp3, DeleteOnTermination: true}
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          dnf install -y docker python3
+          systemctl enable --now docker
+          install -d -m 0700 -o 65532 -g 65532 /opt/telemetry/config /opt/telemetry/data
+          aws secretsmanager get-secret-value --region '${AWS::Region}' --secret-id '${ConfigurationSecretArn}' --query SecretString --output text > /root/telemetry-secret.json
+          chmod 0600 /root/telemetry-secret.json
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          config = json.loads(Path('/root/telemetry-secret.json').read_text())
+          for field, name in [('keys_json','keys.json'),('tls_cert','server.crt'),('tls_key','server.key')]:
+              target = Path('/opt/telemetry/config') / name
+              target.write_text(config[field])
+              os.chown(target,65532,65532)
+              os.chmod(target,0o600)
+          Path('/root/telemetry-secret.json').unlink()
+          PY
+          aws ecr get-login-password --region '${AWS::Region}' | docker login --username AWS --password-stdin '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'
+          docker pull '${ImageUri}'
+          docker run -d --name telemetry --restart unless-stopped --read-only --cap-drop ALL --security-opt no-new-privileges --log-opt max-size=10m --log-opt max-file=3 -p 9443:9443 -v /opt/telemetry/config:/run/config:ro -v /opt/telemetry/data:/data '${ImageUri}'
+Outputs:
+  PublicIp:
+    Value: !GetAtt Instance.PublicIp
+  Note:
+    Value: Configure DNS for the supplied certificate before sending probes. This template has not been applied to AWS.
